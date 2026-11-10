@@ -1,0 +1,5 @@
+build/
+test/sim/sim
+test/sim/i3c_target.pio.h
+__pycache__/
+*.pyc

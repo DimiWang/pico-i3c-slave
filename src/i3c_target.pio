@@ -1,0 +1,132 @@
+; ============================================================================
+; pico-i3c-slave : PIO bit layer of an I3C SDR *target*
+;
+; Two programs:
+;   i3c_tgt_bits  (PIO0) - bit engine. The CPU feeds it one "slot command" per
+;                          group of bits (an address, a data byte + T-bit, an
+;                          ACK, ...). It drives / releases SDA after each SCL
+;                          falling edge and samples SDA on each SCL rising edge.
+;   i3c_tgt_cond  (PIO1) - START / repeated START / STOP detector.
+;
+; Pin mapping for both programs:  in pin 0 = SDA, in pin 1 = SCL (= SDA + 1).
+; The target never drives SCL (I3C SDR targets do not clock-stretch).
+;
+; SPDX-License-Identifier: MIT
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; Bit engine
+;
+; Config: OUT/SET base = SDA (1 pin), IN base = SDA, JMP pin = SDA,
+;         OUT shifts right (LSB first), IN shifts left (first bit ends up MSB),
+;         no autopull / autopush.
+;
+; Every TX FIFO word starts with a 5-bit absolute entry address ("out pc, 5"),
+; which is why the program must be loaded at offset 0 and fill <= 32 words.
+;
+;   xfer : [8:5] = nbits-1, then per bit two bits: [pin value][drive enable]
+;          - drive enable 1: SDA driven to 'pin value' from SCL falling edge
+;            until the next SCL falling edge (push-pull data, or ACK low)
+;          - drive enable 0: SDA released (controller / pull-up owns it)
+;          Pushes the nbits sampled on the SCL rising edges.
+;
+;   arb  : [8:5] = nbits-1, then per bit [pull low][pull low (copy)]
+;          Open-drain arbitration used for the ENTDAA PID/BCR/DCR (and for
+;          open-drain legacy-I2C read data). If we release SDA (send '1') but
+;          sample '0', someone with a lower ID won: release SDA and halt.
+;          Pushes the sampled bits when all bits are done.
+;
+;   tbit : [5] = T value, [6] = copy of T. The T-bit of a byte *we* send:
+;          T=1 ("more data"): drive 1 while SCL low, release on the SCL rising
+;               edge (hand-off). If SDA is low at the next falling edge, the
+;               controller aborted the read with a repeated START -> halt.
+;               Otherwise continue with the next (already queued) data byte.
+;          T=0 ("last byte"): drive 0 through the SCL high phase, release on
+;               the next falling edge and halt (the read is complete).
+;          Pushes nothing.
+;
+;   halt : release SDA, raise PIO IRQ 0 and park. The CPU restarts the state
+;          machine at the next START / STOP.
+; ----------------------------------------------------------------------------
+.program i3c_tgt_bits
+
+.wrap_target
+public slot:
+    pull block                  ; wait for the next slot command
+    out pc, 5                   ; dispatch to xfer / arb / tbit
+
+public xfer:
+    out x, 4                    ; x = nbits - 1
+xfer_bit:
+    wait 0 pin 1                ; SCL low: the bus allows SDA to change now
+    out pins, 1                 ; level first ...
+    out pindirs, 1              ; ... then enable/disable the driver
+    wait 1 pin 1                ; SCL rising edge
+    in pins, 1                  ; sample SDA
+    jmp x-- xfer_bit
+    jmp done
+
+public arb:
+    out x, 4                    ; x = nbits - 1 (output latch is 0: set by the
+arb_bit:                        ;  ACK slot that always precedes arbitration)
+    wait 0 pin 1                ; SCL low
+    out pindirs, 1              ; 1 = pull SDA low ('0'), 0 = release ('1')
+    out y, 1                    ; remember what we sent
+    wait 1 pin 1                ; SCL rising edge
+    in pins, 1
+    jmp pin arb_next            ; SDA high -> nothing to check
+    jmp !y halt                 ; SDA low although we released -> lost
+arb_next:
+    jmp x-- arb_bit
+done:
+    push noblock
+.wrap
+
+public tbit:
+    wait 0 pin 1                ; SCL low after the 8th data bit
+    out pins, 1                 ; T value
+    set pindirs, 1              ; drive T (push-pull)
+    out y, 1                    ; y = T
+    wait 1 pin 1                ; SCL rising edge: controller samples T
+    jmp !y tbit_fall            ; T=0: keep SDA low during SCL high
+    set pindirs, 0              ; T=1: hand SDA over to the controller now
+tbit_fall:
+    wait 0 pin 1                ; next SCL falling edge
+    jmp !y halt                 ; T=0: read done -> release + halt
+    jmp pin slot                ; T=1 and SDA high: controller wants more
+public halt:                    ; T=1 and SDA low: controller aborted (Sr)
+    set pindirs, 0              ; release SDA
+    irq wait 0                  ; tell the CPU and park until restarted
+
+; ----------------------------------------------------------------------------
+; START / STOP detector
+;
+; Config: IN base = SDA, JMP pin = SCL, IN shifts left, no autopush.
+; Pushes 1 for START/repeated START, 2 for STOP.
+;
+; SDA may only change while SCL is low, except for START (SDA falls while
+; SCL is high) and STOP (SDA rises while SCL is high). The 1-cycle delay on
+; each wait means an SDA edge that coincides with an SCL falling edge is
+; checked after SCL has already gone low, so it is not mistaken for START
+; or STOP.
+; ----------------------------------------------------------------------------
+.program i3c_tgt_cond
+
+.wrap_target
+sda_fall:
+    wait 0 pin 0 [1]            ; SDA falling edge
+    jmp pin got_start           ; ... while SCL high = START / Sr
+sda_rise:
+    wait 1 pin 0 [1]            ; SDA rising edge
+    jmp pin got_stop            ; ... while SCL high = STOP
+    jmp sda_fall
+got_start:
+    set y, 1
+    mov isr, y
+    push noblock
+    jmp sda_rise
+got_stop:
+    set y, 2
+    mov isr, y
+    push noblock
+.wrap
