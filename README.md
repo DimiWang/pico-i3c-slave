@@ -49,16 +49,23 @@ The RP2040 has no I3C hardware, so the bit level runs on two PIO state machines 
 1. Download [`bin/pico_i3c_slave.uf2`](bin/pico_i3c_slave.uf2).
 2. Hold **BOOTSEL** on the *target* Pico while you plug in USB. A drive called `RPI-RP2` appears.
 3. Drag `pico_i3c_slave.uf2` onto that drive. The Pico reboots into the firmware.
-4. Open its USB serial port (any baud rate) with PuTTY, Tera Term, `screen /dev/ttyACM1`, `minicom`, or `python -m serial.tools.miniterm`. You should see:
+4. Open its USB serial port (any baud rate) with PuTTY, Tera Term, `screen /dev/ttyACM1`, `minicom`, or `python -m serial.tools.miniterm`. A terminal that asserts **DTR** is required for USB output (PuTTY and `python -m serial.tools.miniterm` do; a plain `cat` of the port often does not). You should see a banner, then a heartbeat every 2 seconds even if the I3C bus is quiet:
 
 ```
-=== pico-i3c-slave v1.0.0 : RP2040 I3C SDR target ===
+=== pico-i3c-slave v1.1.0 : RP2040 I3C SDR target ===
 SDA=GPIO16 SCL=GPIO17  sys_clk=200000 kHz
 PID=FFFE3C010001 BCR=0x01 DCR=0x00 static=0x42 dynamic=none
-Type 'help' for console commands. Bus events follow:
+USB=DTR  debug UART=GPIO0 TX / GPIO1 RX 115200 8N1
+Onboard LED blinks if this firmware is running.
+Type 'help' for console commands. Heartbeat every 2s; bus events follow:
+[HB  2.000123] usb=DTR  SDA=1 SCL=1  static=0x42 dynamic=none  frames=0 naks=0
 ```
 
-> Both the I3CBlaster and this firmware use the standard pico-sdk USB ID **2E8A:000A**, so you will see two serial ports. This firmware's port reports the USB product string **`pico-i3c-slave`**. On Linux, `ls -l /dev/serial/by-id/` shows which port is which.
+The onboard LED on a stock Pico (GPIO25) blinks about once a second if this firmware is running.
+
+> Both the I3CBlaster and this firmware use the standard pico-sdk USB ID **2E8A:000A**, so you will see two serial ports. This firmware's port reports the USB product string **`pico-i3c-slave`**. On Linux, `ls -l /dev/serial/by-id/` shows which port is which. If you open the I3CBlaster port by mistake, you will not see these log lines.
+
+If USB serial stays blank, use the backup UART: connect a USB-UART adapter to **GPIO0 (TX)**, **GPIO1 (RX)** and **GND**, 115200 8N1. That output starts as soon as the Pico boots and does not need DTR. Do not use GPIO16/17 for this — those are the I3C pins.
 
 ## 3. Build from source
 
@@ -324,12 +331,15 @@ Notes on the I3CBlaster Python module, current at the time of writing. Check the
 | Command | Action |
 |---|---|
 | `help` | list commands |
-| `status` | dynamic/static address, identity, ENEC mask, MWL/MRL, register pointer, counters (frames, NACKs, parity errors, ENTDAA losses, dropped log lines) |
+| `status` | dynamic/static address, identity, SDA/SCL levels, USB state, counters (frames, NACKs, parity errors, ENTDAA losses, dropped log lines) |
 | `dump [off] [len]` | hex dump of the 256-byte memory |
 | `fill <byte>` | fill memory |
 | `pattern` | refill with `00 01 … FF` |
+| `heartbeat on` / `heartbeat off` | periodic alive message (default on) |
 
-Log line types: `CCC bcast`, `CCC direct` (header + defining bytes), `CCC direct … -> addr W` / `<- addr R` (direct segment to us), `SDR write` / `SDR read`, `I2C write` / `I2C read`, `DAA …` (every dynamic address change), `ERR …` (parity errors, invalid DA), `HDR …`.
+Log line types: `HB …` (heartbeat every 2 s), `BUS START` / `BUS Sr` / `BUS STOP`, `ADDR 0x.. W/R ACK/NACK (START|Sr)`, `CCC bcast`, `CCC direct` (header + defining bytes), `CCC direct … -> addr W` / `<- addr R` (direct segment to us), `SDR write` / `SDR read`, `I2C write` / `I2C read`, `DAA …` (every dynamic address change), `ERR …` (parity errors, invalid DA), `HDR …`.
+
+A quiet bus with only `[HB …]` lines means the firmware is up and the USB/UART log is working, but no I3C START has been seen yet. After `i3c_scan` you should also see `BUS START`, `ADDR 0x42 W ACK (START)` and `BUS STOP`. If SDA or SCL is 0 in the heartbeat, a line is stuck low (wiring or a missing pull-up).
 
 ## 7. Supported CCCs and transfers
 

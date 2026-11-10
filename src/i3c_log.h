@@ -28,6 +28,8 @@ typedef enum {
     EV_ENTDAA_LOST,    /* lost ENTDAA arbitration: data = bytes we got out  */
     EV_ERR,            /* arg = err_t, addr/ccc = context                   */
     EV_HDR,            /* HDR entered (ccc = ENTHDRx), ignored until idle    */
+    EV_BUS,            /* arg: 1=START, 2=Sr, 3=STOP                         */
+    EV_ADDR,           /* address phase: addr, arg bits: 0=RnW, 1=ACK, 2=after START (not Sr) */
 } ev_type_t;
 
 typedef enum {

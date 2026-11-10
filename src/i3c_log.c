@@ -185,6 +185,15 @@ size_t i3c_log_format(const i3c_log_rec_t *r, char *buf, size_t size)
         ADD("HDR  0x%02X %s: HDR is not supported, ignoring bus until it is idle", r->ccc,
             i3c_ccc_name(r->ccc));
         break;
+    case EV_BUS:
+        ADD("BUS  %s", r->arg == 1 ? "START" : r->arg == 2 ? "Sr" : r->arg == 3 ? "STOP" : "?");
+        break;
+    case EV_ADDR:
+        ADD("ADDR 0x%02X %c %s (%s)", r->addr,
+            (r->arg & 1u) ? 'R' : 'W',
+            (r->arg & 2u) ? "ACK" : "NACK",
+            (r->arg & 4u) ? "START" : "Sr");
+        break;
     default:
         ADD("??? event %u", r->type);
         break;

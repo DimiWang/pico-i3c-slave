@@ -2,7 +2,7 @@
  * pico-i3c-slave - Raspberry Pi Pico (RP2040) as an I3C SDR target
  *
  *   core 1 : I3C protocol state machine (i3c_target.c) + PIO bit layer
- *   core 0 : USB CDC serial: prints every bus event and offers a tiny console
+ *   core 0 : USB CDC + UART0 serial: prints every bus event and a heartbeat
  *
  * SPDX-License-Identifier: MIT
  */
@@ -13,6 +13,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
+#include "hardware/gpio.h"
 #include "hardware/vreg.h"
 #include "tusb.h"
 
@@ -21,7 +22,11 @@
 #include "i3c_phy.h"
 #include "i3c_target.h"
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
+#define HEARTBEAT_US 2000000u
+#define LED_TOGGLE_US 500000u
+
+static bool heartbeat_on = true;
 
 static void core1_main(void)
 {
@@ -29,6 +34,30 @@ static void core1_main(void)
     i3c_target_init();
     for (;;)
         i3c_target_poll();
+}
+
+static void led_init(void)
+{
+#ifdef PICO_DEFAULT_LED_PIN
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+#endif
+}
+
+static void led_toggle(void)
+{
+#ifdef PICO_DEFAULT_LED_PIN
+    gpio_xor_mask(1u << PICO_DEFAULT_LED_PIN);
+#endif
+}
+
+static const char *usb_state(void)
+{
+    if (tud_cdc_connected()) return "DTR";
+    if (tud_mounted())       return "mounted, no DTR";
+    if (tud_ready())         return "ready";
+    return "not enumerated";
 }
 
 static void print_banner(void)
@@ -41,7 +70,10 @@ static void print_banner(void)
     printf("PID=%012llX BCR=0x%02X DCR=0x%02X static=0x%02X dynamic=",
            (unsigned long long)I3C_PID, I3C_BCR, I3C_DCR, I3C_STATIC_ADDR);
     if (s.dyn_addr) printf("0x%02X\r\n", s.dyn_addr); else printf("none\r\n");
-    printf("Type 'help' for console commands. Bus events follow:\r\n");
+    printf("USB=%s  debug UART=GPIO0 TX / GPIO1 RX 115200 8N1\r\n", usb_state());
+    printf("Onboard LED blinks if this firmware is running.\r\n");
+    printf("Type 'help' for console commands. Heartbeat every 2s; bus events follow:\r\n");
+    stdio_flush();
 }
 
 static void print_status(void)
@@ -56,9 +88,27 @@ static void print_status(void)
     printf("events (ENEC)   : 0x%02X  (IBI/Hot-Join not implemented)\r\n", s.events);
     printf("MWL / MRL       : %u / %u\r\n", s.mwl, s.mrl);
     printf("register pointer: 0x%02X\r\n", s.mem_ptr);
+    printf("SDA=%d SCL=%d (idle is both 1, pulled up)\r\n",
+           gpio_get(I3C_SDA_PIN), gpio_get(I3C_SCL_PIN));
+    printf("USB             : %s\r\n", usb_state());
     printf("frames %lu, NACKed addresses %lu, parity errors %lu, ENTDAA lost %lu, log dropped %lu\r\n",
            (unsigned long)s.frames, (unsigned long)s.naks, (unsigned long)s.parity_errors,
            (unsigned long)s.entdaa_lost, (unsigned long)i3c_log_dropped());
+    stdio_flush();
+}
+
+static void print_heartbeat(void)
+{
+    i3c_target_status_t s;
+    i3c_target_get_status(&s);
+    uint32_t us = time_us_32();
+    printf("[HB  %lu.%06lu] usb=%s  SDA=%d SCL=%d  static=0x%02X dynamic=",
+           (unsigned long)(us / 1000000u), (unsigned long)(us % 1000000u),
+           usb_state(), gpio_get(I3C_SDA_PIN), gpio_get(I3C_SCL_PIN), I3C_STATIC_ADDR);
+    if (s.dyn_addr) printf("0x%02X", s.dyn_addr); else printf("none");
+    printf("  frames=%lu naks=%lu\r\n",
+           (unsigned long)s.frames, (unsigned long)s.naks);
+    stdio_flush();
 }
 
 static void dump_mem(unsigned off, unsigned len)
@@ -70,6 +120,7 @@ static void dump_mem(unsigned off, unsigned len)
         printf(" %02X", i3c_mem[a]);
     }
     printf("\r\n");
+    stdio_flush();
 }
 
 static void handle_line(char *line)
@@ -81,14 +132,17 @@ static void handle_line(char *line)
 
     if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
         printf("help                 this text\r\n"
-               "status               addresses, identity, counters\r\n"
+               "status               addresses, identity, pin levels, counters\r\n"
                "dump [off] [len]     hex dump of the 256-byte register memory\r\n"
                "fill <byte>          fill memory with one value\r\n"
-               "pattern              fill memory with 00 01 02 .. FF (boot default)\r\n");
+               "pattern              fill memory with 00 01 02 .. FF (boot default)\r\n"
+               "heartbeat on|off     periodic alive message (default on)\r\n");
     } else if (!strcmp(cmd, "status")) {
         print_status();
+        return;
     } else if (!strcmp(cmd, "dump")) {
         dump_mem(a1 ? (unsigned)strtoul(a1, NULL, 0) : 0, a2 ? (unsigned)strtoul(a2, NULL, 0) : 256);
+        return;
     } else if (!strcmp(cmd, "fill") && a1) {
         uint8_t v = (uint8_t)strtoul(a1, NULL, 0);
         for (unsigned i = 0; i < I3C_MEM_SIZE; i++) i3c_mem[i] = v;
@@ -96,9 +150,14 @@ static void handle_line(char *line)
     } else if (!strcmp(cmd, "pattern")) {
         for (unsigned i = 0; i < I3C_MEM_SIZE; i++) i3c_mem[i] = (uint8_t)i;
         printf("OK\r\n");
+    } else if (!strcmp(cmd, "heartbeat")) {
+        if (a1 && (!strcmp(a1, "on") || !strcmp(a1, "1"))) heartbeat_on = true;
+        else if (a1 && (!strcmp(a1, "off") || !strcmp(a1, "0"))) heartbeat_on = false;
+        printf("heartbeat %s\r\n", heartbeat_on ? "on" : "off");
     } else {
         printf("unknown command '%s' (try 'help')\r\n", cmd);
     }
+    stdio_flush();
 }
 
 int main(void)
@@ -109,14 +168,21 @@ int main(void)
 #endif
     set_sys_clock_khz(I3C_SYS_CLK_KHZ, true);
     stdio_init_all();
+    led_init();
+
+    /* Banner goes out on UART immediately. USB may still be enumerating. */
+    print_banner();
 
     multicore_launch_core1(core1_main);
 
     char line[80];
     unsigned len = 0;
-    bool was_connected = false;
+    bool was_connected = tud_cdc_connected();
+    bool announced_usb = false;
     i3c_log_rec_t rec;
     char out[256];
+    uint32_t last_hb = time_us_32();
+    uint32_t last_led = last_hb;
 
     for (;;) {
         bool conn = tud_cdc_connected();
@@ -125,10 +191,26 @@ int main(void)
             print_banner();
         }
         was_connected = conn;
+        if (tud_mounted() && !announced_usb) {
+            announced_usb = true;
+            printf("USB enumerated. Product string is 'pico-i3c-slave'.\r\n");
+            stdio_flush();
+        }
 
         while (i3c_log_pop(&rec)) {
             i3c_log_format(&rec, out, sizeof out);
             printf("%s\r\n", out);
+            stdio_flush();
+        }
+
+        uint32_t now = time_us_32();
+        if ((uint32_t)(now - last_led) >= LED_TOGGLE_US) {
+            last_led = now;
+            led_toggle();
+        }
+        if (heartbeat_on && (uint32_t)(now - last_hb) >= HEARTBEAT_US) {
+            last_hb = now;
+            print_heartbeat();
         }
 
         int ch = getchar_timeout_us(0);

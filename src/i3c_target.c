@@ -337,6 +337,19 @@ static void nack(void)
     t.naks++;
 }
 
+/* arg bits: 0 = RnW, 1 = ACK, 2 = followed a START (not a repeated START) */
+static void log_addr(uint8_t a, bool rnw, bool ack, bool start)
+{
+    uint8_t flags = (uint8_t)((rnw ? 1u : 0u) | (ack ? 2u : 0u) | (start ? 4u : 0u));
+    log_rec(EV_ADDR, a, 0, flags, NULL, 0);
+}
+
+static void nack_addr(uint8_t a, bool rnw, bool start)
+{
+    log_addr(a, rnw, false, start);
+    nack();
+}
+
 static void ack_then_receive(uint8_t ctx)
 {
     q(s_ack, TAG_IGNORE);
@@ -348,11 +361,11 @@ static void ack_then_receive(uint8_t ctx)
 static void be16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 
 /* Sr + address while a direct CCC is active */
-static void on_direct_addr(uint8_t a, bool rnw)
+static void on_direct_addr(uint8_t a, bool rnw, bool start)
 {
     bool match = (t.ccc == CCC_SETDASA) ? (t.da == 0 && a == I3C_STATIC_ADDR)
                                         : (t.da != 0 && a == t.da);
-    if (!match) { nack(); return; }
+    if (!match) { nack_addr(a, rnw, start); return; }
 
     uint8_t len = 0;
     if (!rnw) {
@@ -360,17 +373,19 @@ static void on_direct_addr(uint8_t a, bool rnw)
         case CCC_SETDASA: case CCC_SETNEWDA:
         case CCC_ENEC_D:  case CCC_DISEC_D:
         case CCC_SETMWL_D: case CCC_SETMRL_D:
+            log_addr(a, rnw, true, start);
             seg_begin(SEG_DIRECT, a);
             ack_then_receive(CTX_CCC_DIR_W);
             return;
         case CCC_RSTDAA_D:
+            log_addr(a, rnw, true, start);
             seg_begin(SEG_DIRECT, a);
             q(s_ack, TAG_IGNORE);
             q(s_rx1, TAG_IGNORE);           /* release SDA after ACK */
             set_da(0, DA_RSTDAA_DIRECT, NULL, 0);
             return;
         default:
-            nack();
+            nack_addr(a, rnw, start);
             return;
         }
     }
@@ -391,9 +406,10 @@ static void on_direct_addr(uint8_t a, bool rnw)
     case CCC_GETMRL:    be16(t.rd_buf, t.mrl); len = 2; break;   /* BCR[2]=0: no IBI byte */
     case CCC_GETMXDS:   t.rd_buf[0] = I3C_MXDS_WR; t.rd_buf[1] = I3C_MXDS_RD; len = 2; break;
     default:
-        nack();
+        nack_addr(a, rnw, start);
         return;
     }
+    log_addr(a, rnw, true, start);
     seg_begin(SEG_DIRECT, a);
     t.ctx = CTX_IGNORE;
     q(s_ack, TAG_IGNORE);
@@ -410,6 +426,7 @@ static void on_addr(uint32_t w)
     if (a == I3C_BCAST_ADDR) {
         if (!rnw) {
             /* Broadcast header: always ACK. A CCC code may follow, or Sr.   */
+            log_addr(a, rnw, true, first);
             t.ccc_active = false;
             t.entdaa = false;
             seg_begin(SEG_CCC_HDR, a);
@@ -422,6 +439,7 @@ static void on_addr(uint32_t w)
         if (t.entdaa && t.da == 0) {
             /* ENTDAA round: ACK, then arbitrate with PID/BCR/DCR. The address
              * byte slot is queued right behind; we only get there if we win. */
+            log_addr(a, rnw, true, first);
             seg_begin(SEG_ENTDAA, a);
             q(s_ack, TAG_IGNORE);
             for (int i = 0; i < 8; i++)
@@ -429,12 +447,12 @@ static void on_addr(uint32_t w)
             q(s_rx8, TAG_DAA_ADDR);
             return;
         }
-        nack();
+        nack_addr(a, rnw, first);
         return;
     }
 
     if (t.ccc_active && t.ccc >= 0x80) {
-        on_direct_addr(a, rnw);
+        on_direct_addr(a, rnw, first);
         return;
     }
 
@@ -445,6 +463,7 @@ static void on_addr(uint32_t w)
     if (on_sa && (first || t.i2c_frame)) {
         t.i2c_frame = true;
         /* START + static address without 0x7E header: legacy I2C framing */
+        log_addr(a, rnw, true, first);
         seg_begin(rnw ? SEG_I2C_R : SEG_I2C_W, a);
         q(s_ack, TAG_IGNORE);
         if (rnw) {
@@ -462,9 +481,10 @@ static void on_addr(uint32_t w)
 #if !I3C_RESPOND_ON_STATIC_ADDR
     on_sa = false;
 #endif
-    if (!on_da && !on_sa) { nack(); return; }
+    if (!on_da && !on_sa) { nack_addr(a, rnw, first); return; }
 
     /* I3C SDR private transfer */
+    log_addr(a, rnw, true, first);
     if (rnw) {
         seg_begin(SEG_PRIV_R, a);
         q(s_ack, TAG_IGNORE);
@@ -667,15 +687,18 @@ static void on_condition(uint32_t c)
             /* START from idle: the engine is already waiting for the address */
             t.armed_start = false;
             t.frames++;
+            log_rec(EV_BUS, 0, 0, 1, NULL, 0);
             return;
         }
         /* repeated START */
+        log_rec(EV_BUS, 0, 0, 2, NULL, 0);
         seg_end();
         engine_reset();
         q(s_rx8, TAG_ADDR);
         pump();
         t.first_after_start = false;
     } else {
+        log_rec(EV_BUS, 0, 0, 3, NULL, 0);
         seg_end();
         t.ccc_active = false;
         t.entdaa = false;

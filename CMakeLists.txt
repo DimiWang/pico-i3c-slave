@@ -35,6 +35,10 @@ target_compile_definitions(pico_i3c_slave PRIVATE
     # Same VID:PID as every pico-sdk CDC device (2E8A:000A) - including the
     # I3CBlaster itself - so give the port a distinct product string.
     USBD_PRODUCT="pico-i3c-slave"
+    PICO_DEFAULT_UART=0
+    PICO_DEFAULT_UART_TX_PIN=0
+    PICO_DEFAULT_UART_RX_PIN=1
+    PICO_DEFAULT_UART_BAUD_RATE=115200
 )
 target_compile_options(pico_i3c_slave PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 
@@ -50,7 +54,7 @@ target_link_libraries(pico_i3c_slave
 pico_set_binary_type(pico_i3c_slave copy_to_ram)
 
 pico_enable_stdio_usb(pico_i3c_slave 1)
-pico_enable_stdio_uart(pico_i3c_slave 0)
+pico_enable_stdio_uart(pico_i3c_slave 1)
 
 pico_set_program_name(pico_i3c_slave "pico-i3c-slave")
 pico_set_program_description(pico_i3c_slave "I3C SDR target for testing I3CBlaster")
